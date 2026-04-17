@@ -40,6 +40,39 @@ def test_next_adr_number_skips_non_numbered(tmp_path: Path):
     assert next_adr_number(d) == 4
 
 
+def test_next_adr_number_global_across_dirs(tmp_path: Path):
+    """Global counter: max ADR number is taken across all supplied dirs."""
+    primary = tmp_path / "primary" / "decisions"
+    primary.mkdir(parents=True)
+    (primary / "0001-a.md").touch()
+    (primary / "0002-b.md").touch()
+
+    scoped = tmp_path / "scoped" / "decisions"
+    scoped.mkdir(parents=True)
+    (scoped / "0005-c.md").touch()
+
+    assert next_adr_number(primary) == 3
+    assert next_adr_number(primary, additional_dirs=[scoped]) == 6
+
+
+def test_resolve_decision_path_with_global_counter(tmp_path: Path):
+    """resolve_decision_path threads number_sources through to the counter."""
+    scope_repo = tmp_path / "qf-market"
+    (scope_repo / "docs" / "decisions").mkdir(parents=True)
+    (scope_repo / "docs" / "decisions" / "0001-local.md").touch()
+
+    other = tmp_path / "qf-docs"
+    (other / "docs" / "decisions").mkdir(parents=True)
+    for n in range(1, 7):
+        (other / "docs" / "decisions" / f"{n:04d}-x.md").touch()
+
+    target = resolve_decision_path(
+        scope_repo, "New Decision", number_sources=[other / "docs" / "decisions"]
+    )
+    assert target.name == "0007-new-decision.md"
+    assert target.parent == scope_repo / "docs" / "decisions"
+
+
 def test_resolve_decision_path(tmp_repo: Path):
     target = resolve_decision_path(tmp_repo, "New Redis Schema")
     assert target.name == "0002-new-redis-schema.md"

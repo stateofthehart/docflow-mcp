@@ -4,8 +4,12 @@ A draft carries a `scope` label and optionally a user-supplied `path`. This
 module turns those into an absolute filesystem path where the commit will land.
 
 Rules:
- - `kind=decision`: always goes to `<scope_repo>/docs/decisions/NNNN-<slug>.md`.
-   NNNN is the next available number within the scope_repo's decisions dir.
+ - `kind=decision`: commits to `<scope_repo>/docs/decisions/NNNN-<slug>.md`.
+   NNNN is drawn from a single global counter (shared across all scopes)
+   sourced from the docs_root decisions directory, so ADR numbering is
+   unique across the entire ecosystem even when the file lands in a
+   sub-repo. This prevents number collisions when multiple scopes draft
+   ADRs concurrently.
  - `kind=section`: honors the caller-supplied `path` (required). Path must
    already exist in scope_repo; section updates do not create new files.
  - `kind=stale`: no file path — stale flags do not commit content, they
@@ -24,10 +28,10 @@ def slugify(title: str) -> str:
     return slug[:60] or "untitled"
 
 
-def next_adr_number(decisions_dir: Path) -> int:
-    """Return the next ADR number (1-indexed) based on existing files."""
+def _highest_adr_in_dir(decisions_dir: Path) -> int:
+    """Highest NNNN seen among `NNNN-*.md` files in a single directory."""
     if not decisions_dir.is_dir():
-        return 1
+        return 0
     highest = 0
     for f in decisions_dir.glob("*.md"):
         m = re.match(r"^(\d{4})-", f.name)
@@ -35,15 +39,42 @@ def next_adr_number(decisions_dir: Path) -> int:
             n = int(m.group(1))
             if n > highest:
                 highest = n
+    return highest
+
+
+def next_adr_number(
+    primary_dir: Path, additional_dirs: list[Path] | None = None
+) -> int:
+    """Return the next ADR number, taking the max across all supplied dirs.
+
+    This supports a global ADR counter where NNNN is unique across every
+    scope, even though files land in different repositories. Callers that
+    want per-repo numbering can simply pass a single dir.
+    """
+    highest = _highest_adr_in_dir(primary_dir)
+    for d in additional_dirs or []:
+        highest = max(highest, _highest_adr_in_dir(d))
     return highest + 1
 
 
 def resolve_decision_path(
-    scope_repo: Path, title: str, decisions_subpath: str = "docs/decisions"
+    scope_repo: Path,
+    title: str,
+    decisions_subpath: str = "docs/decisions",
+    number_sources: list[Path] | None = None,
 ) -> Path:
-    """Compute the target path for a new ADR."""
+    """Compute the target path for a new ADR.
+
+    Args:
+        scope_repo: repo where the file will be written.
+        title: ADR title — used to slugify the filename.
+        decisions_subpath: relative path under scope_repo for ADRs.
+        number_sources: additional decisions directories to consult when
+            picking the next ADR number. Used to enforce a global counter
+            shared across multiple repos.
+    """
     decisions_dir = scope_repo / decisions_subpath
-    num = next_adr_number(decisions_dir)
+    num = next_adr_number(decisions_dir, additional_dirs=number_sources)
     return decisions_dir / f"{num:04d}-{slugify(title)}.md"
 
 

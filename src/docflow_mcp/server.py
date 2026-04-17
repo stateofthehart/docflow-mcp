@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from pathlib import Path
+from pathlib import Path  # noqa: F401 — re-used in annotations
 from typing import Any
 
 from fastmcp import FastMCP
@@ -35,6 +35,18 @@ _store: StateStore | None = None
 _reader: DocReader | None = None
 _reviewer: Reviewer | None = None
 _committer: Committer | None = None
+
+
+def _all_decisions_dirs(cfg: Config) -> list[Path]:
+    """All known `docs/decisions/` dirs — docs_root plus every mapped scope.
+
+    Used to enforce a global ADR counter: the next ADR number is the max
+    over every scope's decisions directory, not just the target one.
+    """
+    dirs: list[Path] = [cfg.docs_root / "docs" / "decisions"]
+    for repo in cfg.scope_map.values():
+        dirs.append(repo / "docs" / "decisions")
+    return dirs
 
 
 def _init() -> tuple[Config, StateStore, DocReader, Reviewer, Committer]:
@@ -323,7 +335,9 @@ def commit(draft_id: str) -> str:
     content = store.get_content(draft_id)
     if d.kind == "decision":
         title = extract_title(content)
-        target = resolve_decision_path(scope_repo, title)
+        target = resolve_decision_path(
+            scope_repo, title, number_sources=_all_decisions_dirs(cfg)
+        )
         msg = f"docs: add ADR — {title}"
     elif d.kind == "section":
         if not d.path:
@@ -404,7 +418,9 @@ def escalate(draft_id: str, reason: str) -> str:
         branch = f"docs/agent-{draft_id}"
         if d.kind == "decision":
             title = extract_title(content)
-            target = resolve_decision_path(scope_repo, title)
+            target = resolve_decision_path(
+                scope_repo, title, number_sources=_all_decisions_dirs(cfg)
+            )
             msg = f"docs: escalated ADR draft — {title}"
             pr_title = f"[docs-escalated] ADR: {title}"
         else:  # section
