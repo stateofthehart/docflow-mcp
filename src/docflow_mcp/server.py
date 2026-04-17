@@ -1,15 +1,25 @@
 """MCP tool surface for agent-authored documentation.
 
-Eleven tools spanning read, write (staged), review, commit, and admin concerns.
-The workflow is state-machine enforced:
-    draft -> (review -> revise -> review -> ...) -> commit | escalate | abandon
+Eleven tools across read, write (staged), review, commit, and admin concerns.
+State-machine workflow:
+    draft -> (prepare_review -> submit_review -> revise -> ...) -> commit | escalate | abandon
+
+docflow-mcp does not call any LLM. The review step is split in two:
+    - `prepare_review(draft_id)` returns a self-contained bundle the caller
+      hands to its own sub-agent spawner (e.g. myllm.spawn_agent).
+    - `submit_review(draft_id, verdict, ...)` records the sub-agent's verdict
+      so the commit gate can enforce it.
+
+This keeps docflow a pure state/storage layer with no HTTP client, no LLM
+profile assumptions, and no circular tool dependencies with the reviewer.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import asdict
-from pathlib import Path  # noqa: F401 — re-used in annotations
+from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
@@ -18,7 +28,6 @@ from .committer import Committer
 from .config import Config
 from .plane_stale import open_stale_issue
 from .reader import DocReader
-from .reviewer import Reviewer
 from .scope import (
     extract_title,
     resolve_decision_path,
@@ -33,7 +42,6 @@ mcp = FastMCP("docflow-mcp")
 _cfg: Config | None = None
 _store: StateStore | None = None
 _reader: DocReader | None = None
-_reviewer: Reviewer | None = None
 _committer: Committer | None = None
 
 
@@ -49,24 +57,27 @@ def _all_decisions_dirs(cfg: Config) -> list[Path]:
     return dirs
 
 
-def _init() -> tuple[Config, StateStore, DocReader, Reviewer, Committer]:
-    global _cfg, _store, _reader, _reviewer, _committer
+def _init() -> tuple[Config, StateStore, DocReader, Committer]:
+    global _cfg, _store, _reader, _committer
     if _cfg is None:
         _cfg = Config.from_env()
     if _store is None:
         _store = StateStore(_cfg.state_dir)
     if _reader is None:
         _reader = DocReader(_cfg.docs_root)
-    if _reviewer is None:
-        _reviewer = Reviewer(
-            gateway_url=_cfg.reviewer_url,
-            profile=_cfg.reviewer_profile,
-            prompts_dir=_cfg.prompts_dir,
-            timeout=_cfg.review_timeout,
-        )
     if _committer is None:
         _committer = Committer()
-    return _cfg, _store, _reader, _reviewer, _committer
+    return _cfg, _store, _reader, _committer
+
+
+def _prompt_for_kind(prompts_dir: Path, kind: str) -> tuple[str, str]:
+    """Return (prompt_text, prompt_hash) for a given draft kind."""
+    path = prompts_dir / f"{kind}.md"
+    if not path.is_file():
+        raise FileNotFoundError(f"No reviewer prompt for kind '{kind}' at {path}")
+    text = path.read_text(encoding="utf-8")
+    digest = hashlib.sha256(text.encode()).hexdigest()[:12]
+    return text, digest
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -83,7 +94,7 @@ def search(query: str, category: str | None = None, limit: int = 25) -> str:
         category: optional subdir under docs/ to scope to (e.g. "decisions", "contracts")
         limit: max hits to return (default 25)
     """
-    _, _, reader, _, _ = _init()
+    _, _, reader, _ = _init()
     hits = reader.search(query, category=category, limit=limit)
     if not hits:
         return "No results."
@@ -102,7 +113,7 @@ def read(path: str, section: str | None = None) -> str:
         path: relative path under docs_root (e.g. "docs/decisions/0003-foo.md")
         section: optional heading text; returns only that section's body
     """
-    _, _, reader, _, _ = _init()
+    _, _, reader, _ = _init()
     try:
         return reader.read(path, section=section)
     except (FileNotFoundError, LookupError, ValueError) as e:
@@ -117,7 +128,7 @@ def list_docs(category: str | None = None, changed_since_days: int | None = None
         category: subdir under docs/ (e.g. "decisions", "contracts")
         changed_since_days: only include files modified within the last N days
     """
-    _, _, reader, _, _ = _init()
+    _, _, reader, _ = _init()
     rows = reader.list(category=category, changed_since_days=changed_since_days)
     if not rows:
         return "No matching docs."
@@ -127,7 +138,7 @@ def list_docs(category: str | None = None, changed_since_days: int | None = None
 @mcp.tool
 def recent(limit: int = 10) -> str:
     """Recent commits that touched any docs file. Useful for "what changed lately?"."""
-    _, _, reader, _, _ = _init()
+    _, _, reader, _ = _init()
     rows = reader.recent(limit=limit)
     if not rows:
         return "No recent doc commits."
@@ -157,7 +168,7 @@ def draft(
               for "section", ignored for "decision" (auto-routed) and "stale".
         reason: free-text justification, recommended for "section" and "stale".
     """
-    cfg, store, _, _, _ = _init()
+    cfg, store, _, _ = _init()
     if kind not in ("decision", "section", "stale"):
         return f"ERROR: unknown kind '{kind}'. Use 'decision', 'section', or 'stale'."
     try:
@@ -186,83 +197,192 @@ def draft(
             "path": d.path,
             "iteration": d.iteration,
             "state": d.state,
-            "next_step": "Call `review(draft_id='" + d.id + "')` before committing.",
+            "next_step": (
+                "Call `prepare_review(draft_id='" + d.id + "')` to get a "
+                "reviewer bundle, spawn your reviewer sub-agent with it, "
+                "then call `submit_review(...)` with the verdict."
+            ),
         },
         indent=2,
     )
 
 
 @mcp.tool
-def review(draft_id: str) -> str:
-    """Run the reviewer sub-agent against the draft's current iteration.
+def prepare_review(draft_id: str) -> str:
+    """Return a self-contained review bundle for this draft's current iteration.
 
-    The reviewer uses a separate model (configured in MyLLM) with its own MCP
-    stack so it can verify claims against code and existing docs. Returns the
-    parsed verdict plus structured issue list.
+    The caller (author agent) passes the returned `system_prompt` and `task`
+    to its own sub-agent spawner (e.g. `myllm.spawn_agent` with the returned
+    `working_dir`). The sub-agent emits a YAML verdict. The caller then
+    submits that verdict via `submit_review`.
+
+    docflow does NOT call any LLM — it just assembles the review package.
+
+    Returns JSON with:
+        kind               draft kind (decision / section / stale)
+        iteration          iteration being reviewed (0-indexed)
+        system_prompt      prompt text the reviewer's system role should get
+        prompt_hash        sha256 prefix of the prompt — pass to submit_review
+                           so we can detect reviews against stale prompts later
+        working_dir        absolute path the reviewer's file tools should be
+                           sandboxed to (docs_root; reviewer can read any doc)
+        task               formatted user-role message for the reviewer, with
+                           draft content + context inline
+        suggested_profile  suggestion string only — reviewer profile is
+                           caller's choice
     """
-    cfg, store, reader, reviewer, _ = _init()
+    cfg, store, reader, _ = _init()
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
     if d.state in ("committed", "abandoned", "escalated"):
-        return f"ERROR: draft is '{d.state}' and cannot be reviewed again."
-
+        return f"ERROR: draft is '{d.state}' and cannot be reviewed."
     if d.iteration >= cfg.max_iterations:
-        store.mark_escalated(
-            draft_id,
-            reason=f"Auto-escalated after {cfg.max_iterations} iterations.",
-        )
         return json.dumps(
             {
-                "verdict": "escalate",
-                "reason": "max_iterations_exceeded",
+                "error": "max_iterations_exceeded",
                 "iteration": d.iteration,
                 "max": cfg.max_iterations,
+                "next_step": (
+                    f"Call `escalate(draft_id='{draft_id}', reason=...)` — this"
+                    " draft has consumed its revise budget."
+                ),
             },
             indent=2,
         )
 
     content = store.get_content(draft_id)
+    try:
+        prompt_text, prompt_hash = _prompt_for_kind(cfg.prompts_dir, d.kind)
+    except FileNotFoundError as e:
+        return f"ERROR: {e}"
 
-    context: dict[str, Any] = {
-        "scope": d.scope,
-        "path": d.path,
-        "docs_root": str(cfg.docs_root),
-    }
-    if d.kind == "section" and d.path:
-        try:
-            context["old_section"] = reader.read(d.path)
-        except (FileNotFoundError, ValueError):
-            pass
+    task_parts = [
+        f"# Review request — kind: {d.kind}",
+        "",
+        f"Draft id: `{draft_id}`  ·  iteration: {d.iteration}  ·  scope: {d.scope}",
+        "",
+        "## Draft content",
+        "",
+        content,
+        "",
+    ]
+    if d.path:
+        task_parts.extend(["## Target path (relative to scope repo)", d.path, ""])
     reason = (d.metadata or {}).get("reason")
     if reason:
-        context["reason"] = reason
-
-    try:
-        result = reviewer.review(kind=d.kind, content=content, context=context)
-    except Exception as e:
-        return f"ERROR: reviewer call failed: {e}"
-
-    store.record_review(
-        draft_id=draft_id,
-        iteration=d.iteration,
-        verdict=result.verdict,  # type: ignore[arg-type]
-        issues=result.issues,
-        notes=result.notes,
-        reviewer_model=result.reviewer_model,
-        reviewer_prompt_hash=result.prompt_hash,
+        task_parts.extend(["## Author's reason", reason, ""])
+    if d.kind == "section" and d.path:
+        try:
+            existing = reader.read(d.path)
+            task_parts.extend(
+                [
+                    "## Existing section content (the doc as it stands on disk)",
+                    existing,
+                    "",
+                ]
+            )
+        except (FileNotFoundError, ValueError):
+            pass
+    task_parts.extend(
+        [
+            "## Reviewer working directory",
+            f"{cfg.docs_root}",
+            "",
+            "Use your read_file / list_files / grep tools to explore related",
+            "docs if needed. Your working directory is sandboxed to this path;",
+            "code-graph claims should be treated with skepticism unless the",
+            "author embedded verification results above.",
+            "",
+            "Output your review strictly as the YAML block specified in your",
+            "system prompt. No prose outside the YAML block.",
+        ]
     )
-    store.mark_reviewed(draft_id)
 
     return json.dumps(
         {
             "draft_id": draft_id,
             "iteration": d.iteration,
-            "verdict": result.verdict,
-            "issues": result.issues,
-            "notes": result.notes,
-            "reviewer_model": result.reviewer_model,
-            "prompt_hash": result.prompt_hash,
+            "kind": d.kind,
+            "system_prompt": prompt_text,
+            "prompt_hash": prompt_hash,
+            "working_dir": str(cfg.docs_root),
+            "task": "\n".join(task_parts),
+            "suggested_profile": "docs-reviewer",
+            "next_step": (
+                f"Pass system_prompt + task to your sub-agent spawner "
+                f"(e.g. myllm.spawn_agent). Then call "
+                f"`submit_review(draft_id='{draft_id}', verdict=..., issues=..., "
+                f"notes=..., reviewer_model=..., prompt_hash='{prompt_hash}')`."
+            ),
+        },
+        indent=2,
+    )
+
+
+@mcp.tool
+def submit_review(
+    draft_id: str,
+    verdict: str,
+    issues: list[dict] | None = None,
+    notes: str | None = None,
+    reviewer_model: str | None = None,
+    prompt_hash: str | None = None,
+) -> str:
+    """Record an externally-produced review verdict for this draft's iteration.
+
+    Machine-checked: only `approve`, `revise`, or `escalate` are accepted.
+    The commit gate consults the latest review for the current iteration;
+    `approve` unlocks commit, anything else does not.
+
+    Args:
+        draft_id: the draft being reviewed.
+        verdict: one of "approve", "revise", "escalate".
+        issues: structured issue list from the reviewer (optional for approve).
+        notes: freeform notes from the reviewer.
+        reviewer_model: the model name that produced this review, for audit.
+        prompt_hash: the prompt_hash returned by prepare_review; recorded so
+                     future reruns can detect prompts that have since changed.
+    """
+    cfg, store, _, _ = _init()
+    d = store.get_draft(draft_id)
+    if d is None:
+        return f"ERROR: no draft '{draft_id}'"
+    if d.state in ("committed", "abandoned", "escalated"):
+        return f"ERROR: draft is '{d.state}'; cannot record a new review."
+    if verdict not in ("approve", "revise", "escalate"):
+        return (
+            f"ERROR: verdict must be one of approve / revise / escalate, "
+            f"got '{verdict}'."
+        )
+    if d.iteration >= cfg.max_iterations and verdict != "escalate":
+        return (
+            f"ERROR: draft has reached max_iterations ({cfg.max_iterations}); "
+            "only an escalate verdict is accepted from here."
+        )
+
+    clean_issues = list(issues or [])
+    store.record_review(
+        draft_id=draft_id,
+        iteration=d.iteration,
+        verdict=verdict,  # type: ignore[arg-type]
+        issues=clean_issues,
+        notes=notes,
+        reviewer_model=reviewer_model,
+        reviewer_prompt_hash=prompt_hash,
+    )
+    store.mark_reviewed(draft_id)
+    return json.dumps(
+        {
+            "draft_id": draft_id,
+            "iteration": d.iteration,
+            "verdict": verdict,
+            "issues_count": len(clean_issues),
+            "next_step": {
+                "approve": f"Call `commit(draft_id='{draft_id}')`.",
+                "revise": f"Call `revise(draft_id='{draft_id}', content=...)` and re-review.",
+                "escalate": f"Call `escalate(draft_id='{draft_id}', reason=...)`.",
+            }[verdict],
         },
         indent=2,
     )
@@ -275,7 +395,7 @@ def revise(draft_id: str, content: str) -> str:
     Increments iteration, resets state to 'drafting'. Caller should then
     call `review(draft_id)` again.
     """
-    _, store, _, _, _ = _init()
+    _, store, _, _ = _init()
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
@@ -303,7 +423,7 @@ def commit(draft_id: str) -> str:
     `section` drafts rewrite the whole target file with the new content.
     `stale` drafts do not commit — use `escalate` to produce a Plane issue.
     """
-    cfg, store, _, _, committer = _init()
+    cfg, store, _, committer = _init()
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
@@ -388,7 +508,7 @@ def escalate(draft_id: str, reason: str) -> str:
     For `stale` drafts: opens a Plane issue (if DOCS_PLANE_STALE_PROJECT
     is configured) with the flag report. Otherwise returns the report text.
     """
-    cfg, store, _, _, committer = _init()
+    cfg, store, _, committer = _init()
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
@@ -472,7 +592,7 @@ def status(draft_id: str | None = None, state: str | None = None) -> str:
     With state filter: returns list of drafts in that state.
     With neither: returns the 20 most recent drafts across all states.
     """
-    _, store, _, _, _ = _init()
+    _, store, _, _ = _init()
     if draft_id:
         d = store.get_draft(draft_id)
         if d is None:
@@ -506,7 +626,7 @@ def status(draft_id: str | None = None, state: str | None = None) -> str:
 @mcp.tool
 def abandon(draft_id: str, reason: str) -> str:
     """Abandon a draft. It stays in the DB for audit until GC after 7 days."""
-    _, store, _, _, _ = _init()
+    _, store, _, _ = _init()
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"

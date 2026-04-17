@@ -1,25 +1,28 @@
 """Runtime configuration loaded from environment variables.
 
-Configuration sources, in order of precedence:
-1. Environment variables set at MCP launch time.
-2. Defaults below.
-
 Variables:
-    DOCS_ROOT            Required. Absolute path of the documentation root repository.
-                         ADRs, contracts, etc. live under DOCS_ROOT/docs/.
-    DOCS_SCOPE_MAP       Optional. Colon-separated list of `scope=path` pairs pointing
-                         at additional repositories that accept scoped drafts.
-                         Example: "qf-redis=/home/ethan/.../qf/redis:qf-market=/home/ethan/.../qf/market"
-    DOCS_STATE_DIR       Optional. Directory for the SQLite state DB. Default: $DOCS_ROOT/.docs-state
-    DOCS_REVIEWER_URL    Optional. HTTP endpoint of the MyLLM gateway used for review calls.
-                         Default: http://localhost:4000
-    DOCS_REVIEWER_PROFILE Optional. MyLLM profile name. Default: docs-reviewer
-    DOCS_MAX_ITERATIONS  Optional. Max draft→revise loops before auto-escalate. Default: 5
-    DOCS_REVIEW_TIMEOUT  Optional. Seconds before review call times out. Default: 600
-    DOCS_PROMPTS_DIR     Optional. Directory containing reviewer prompts. Default: the
-                         `prompts/` directory shipped with the package.
-    DOCS_PLANE_STALE_PROJECT Optional. Plane project id for staleness issues.
-                             If unset, stale flags do not sync to Plane.
+    DOCS_ROOT            Required. Absolute path of the documentation root
+                         repository. ADRs, contracts, etc. live under
+                         DOCS_ROOT/docs/.
+    DOCS_SCOPE_MAP       Optional. Colon-separated list of `scope=path` pairs
+                         pointing at additional repositories that accept
+                         scoped drafts.
+                         Example: "qf-redis=/home/me/quant/qf/redis:qf-market=/home/me/quant/qf/market"
+    DOCS_STATE_DIR       Optional. Directory for the SQLite state DB.
+                         Default: $DOCS_ROOT/.docs-state
+    DOCS_MAX_ITERATIONS  Optional. Max draft→revise loops before the commit
+                         gate refuses new reviews and forces escalate.
+                         Default: 5
+    DOCS_PROMPTS_DIR     Optional. Directory containing reviewer prompts.
+                         Default: the `prompts/` directory shipped with the package.
+    DOCS_PLANE_STALE_PROJECT
+                         Optional. Plane project id for staleness issues.
+                         If unset, stale flags do not sync to Plane.
+
+docflow does not talk to any LLM directly. Reviewer orchestration is the
+caller's responsibility: `prepare_review` returns a self-contained bundle
+the caller feeds to its own LLM gateway, and `submit_review` records the
+verdict back.
 """
 
 from __future__ import annotations
@@ -38,10 +41,7 @@ class Config:
     docs_root: Path
     scope_map: dict[str, Path]
     state_dir: Path
-    reviewer_url: str
-    reviewer_profile: str
     max_iterations: int
-    review_timeout: int
     prompts_dir: Path
     plane_stale_project: str | None
 
@@ -76,10 +76,7 @@ class Config:
             docs_root=docs_root,
             scope_map=scope_map,
             state_dir=state_dir,
-            reviewer_url=os.environ.get("DOCS_REVIEWER_URL", "http://localhost:4000"),
-            reviewer_profile=os.environ.get("DOCS_REVIEWER_PROFILE", "docs-reviewer"),
             max_iterations=int(os.environ.get("DOCS_MAX_ITERATIONS", "5")),
-            review_timeout=int(os.environ.get("DOCS_REVIEW_TIMEOUT", "600")),
             prompts_dir=prompts_dir,
             plane_stale_project=os.environ.get("DOCS_PLANE_STALE_PROJECT") or None,
         )

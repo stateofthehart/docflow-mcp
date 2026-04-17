@@ -12,6 +12,9 @@ license = { text = "MIT" }
 authors = [{ name = "stateofthehart" }]
 dependencies = [
     "fastmcp>=2.0",
+    # httpx kept available because plane_stale.py uses it for Plane issue
+    # filing. It is not required for the review path — docflow never calls
+    # an LLM directly.
     "httpx>=0.27",
 ]
 
