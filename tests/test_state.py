@@ -9,7 +9,8 @@ from docflow_mcp.state import StateStore
 
 def test_create_and_read_draft(store: StateStore):
     d = store.create_draft(
-        kind="decision", scope="cross-repo", path=None, content="# ADR 1: Test\n"
+        collection="default", kind="decision", scope="cross-repo",
+        path=None, content="# ADR 1: Test\n",
     )
     assert d.state == "drafting"
     assert d.iteration == 0
@@ -23,7 +24,8 @@ def test_create_and_read_draft(store: StateStore):
 
 def test_revise_increments_iteration_and_resets_state(store: StateStore):
     d = store.create_draft(
-        kind="decision", scope="cross-repo", path=None, content="v1"
+        collection="default", kind="decision", scope="cross-repo",
+        path=None, content="v1",
     )
     store.record_review(
         draft_id=d.id, iteration=0, verdict="revise",
@@ -41,7 +43,8 @@ def test_revise_increments_iteration_and_resets_state(store: StateStore):
 
 def test_commit_gate_state_transitions(store: StateStore):
     d = store.create_draft(
-        kind="decision", scope="cross-repo", path=None, content="x"
+        collection="default", kind="decision", scope="cross-repo",
+        path=None, content="x",
     )
     store.mark_committed(d.id, target_path="docs/decisions/0001-x.md", branch="main", sha="abc")
     updated = store.get_draft(d.id)
@@ -50,14 +53,14 @@ def test_commit_gate_state_transitions(store: StateStore):
 
 
 def test_revise_rejects_committed_draft(store: StateStore):
-    d = store.create_draft(kind="decision", scope="cross-repo", path=None, content="x")
+    d = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="x")
     store.mark_committed(d.id, "docs/decisions/0001-x.md", "main", "abc")
     with pytest.raises(ValueError, match="Cannot revise"):
         store.revise_draft(d.id, "y")
 
 
 def test_latest_review_returns_most_recent(store: StateStore):
-    d = store.create_draft(kind="decision", scope="cross-repo", path=None, content="x")
+    d = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="x")
     store.record_review(d.id, 0, "revise", [], None, "m1", "h1")
     store.revise_draft(d.id, "x2")
     store.record_review(d.id, 1, "approve", [], "all good", "m2", "h2")
@@ -68,7 +71,7 @@ def test_latest_review_returns_most_recent(store: StateStore):
 
 
 def test_abandon_keeps_row_for_audit(store: StateStore):
-    d = store.create_draft(kind="decision", scope="cross-repo", path=None, content="x")
+    d = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="x")
     store.abandon(d.id, "author reconsidered")
     got = store.get_draft(d.id)
     assert got is not None
@@ -77,8 +80,8 @@ def test_abandon_keeps_row_for_audit(store: StateStore):
 
 
 def test_list_drafts_filters_by_state(store: StateStore):
-    a = store.create_draft(kind="decision", scope="cross-repo", path=None, content="a")
-    b = store.create_draft(kind="decision", scope="cross-repo", path=None, content="b")
+    a = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="a")
+    b = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="b")
     store.abandon(a.id, "x")
     remaining = store.list_drafts(state="drafting")
     ids = {d.id for d in remaining}

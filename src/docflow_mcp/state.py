@@ -31,6 +31,7 @@ Verdict = Literal["approve", "revise", "escalate"]
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS drafts (
     id              TEXT PRIMARY KEY,
+    collection      TEXT NOT NULL,
     kind            TEXT NOT NULL,
     scope           TEXT NOT NULL,
     path            TEXT,
@@ -75,12 +76,14 @@ CREATE TABLE IF NOT EXISTS commits (
 
 CREATE INDEX IF NOT EXISTS idx_drafts_state ON drafts(state);
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at);
+CREATE INDEX IF NOT EXISTS idx_drafts_collection ON drafts(collection);
 """
 
 
 @dataclass
 class Draft:
     id: str
+    collection: str
     kind: DraftKind
     scope: str
     path: str | None
@@ -140,6 +143,7 @@ class StateStore:
 
     def create_draft(
         self,
+        collection: str,
         kind: DraftKind,
         scope: str,
         path: str | None,
@@ -152,10 +156,11 @@ class StateStore:
         meta_json = json.dumps(metadata or {})
         with self._tx() as c:
             c.execute(
-                "INSERT INTO drafts (id, kind, scope, path, state, iteration, "
-                "created_at, updated_at, author_model, metadata_json) "
-                "VALUES (?, ?, ?, ?, 'drafting', 0, ?, ?, ?, ?)",
-                (draft_id, kind, scope, path, now, now, author_model, meta_json),
+                "INSERT INTO drafts (id, collection, kind, scope, path, state, "
+                "iteration, created_at, updated_at, author_model, metadata_json) "
+                "VALUES (?, ?, ?, ?, ?, 'drafting', 0, ?, ?, ?, ?)",
+                (draft_id, collection, kind, scope, path, now, now,
+                 author_model, meta_json),
             )
             c.execute(
                 "INSERT INTO draft_content (draft_id, iteration, content, created_at) "
@@ -306,18 +311,23 @@ class StateStore:
         return row["content"]
 
     def list_drafts(
-        self, state: DraftState | None = None, limit: int = 50
+        self,
+        collection: str | None = None,
+        state: DraftState | None = None,
+        limit: int = 50,
     ) -> list[Draft]:
+        clauses = []
+        params: list = []
+        if collection:
+            clauses.append("collection=?"); params.append(collection)
         if state:
-            rows = self._conn.execute(
-                "SELECT * FROM drafts WHERE state=? ORDER BY updated_at DESC LIMIT ?",
-                (state, limit),
-            ).fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM drafts ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            clauses.append("state=?"); params.append(state)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        rows = self._conn.execute(
+            f"SELECT * FROM drafts {where} ORDER BY updated_at DESC LIMIT ?",
+            tuple(params),
+        ).fetchall()
         return [_draft_from_row(r) for r in rows]
 
     def all_reviews(self, draft_id: str) -> list[Review]:
@@ -344,6 +354,7 @@ class StateStore:
 def _draft_from_row(row: sqlite3.Row) -> Draft:
     return Draft(
         id=row["id"],
+        collection=row["collection"],
         kind=row["kind"],
         scope=row["scope"],
         path=row["path"],

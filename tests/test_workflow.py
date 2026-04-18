@@ -12,7 +12,7 @@ from docflow_mcp.state import StateStore
 def test_commit_gate_requires_approve_verdict(tmp_repo: Path, store: StateStore):
     """commit() must refuse unless the latest review is approve."""
     d = store.create_draft(
-        kind="decision", scope="cross-repo", path=None,
+        collection="default", kind="decision", scope="cross-repo", path=None,
         content="# ADR 0002: New Decision\n\n## Context\n...\n",
     )
 
@@ -55,7 +55,7 @@ def test_commit_gate_requires_approve_verdict(tmp_repo: Path, store: StateStore)
 
 def test_max_iterations_escalates(store: StateStore):
     """Simulating a runaway revise loop — after N iterations, should escalate."""
-    d = store.create_draft(kind="decision", scope="cross-repo", path=None, content="v0")
+    d = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="v0")
     for i in range(4):
         store.record_review(
             draft_id=d.id, iteration=i, verdict="revise",
@@ -75,7 +75,7 @@ def test_max_iterations_escalates(store: StateStore):
 
 
 def test_escalated_draft_cannot_revise(store: StateStore):
-    d = store.create_draft(kind="decision", scope="cross-repo", path=None, content="x")
+    d = store.create_draft(collection="default", kind="decision", scope="cross-repo", path=None, content="x")
     store.mark_escalated(d.id, reason="test")
     try:
         store.revise_draft(d.id, "y")
