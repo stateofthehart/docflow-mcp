@@ -74,6 +74,22 @@ CREATE TABLE IF NOT EXISTS commits (
     FOREIGN KEY (draft_id) REFERENCES drafts(id) ON DELETE CASCADE
 );
 
+-- Escalations progress through stages: branch+commit → push → PR.
+-- Each stage is recorded incrementally so retries can detect what is
+-- already done and skip it.
+CREATE TABLE IF NOT EXISTS escalations (
+    draft_id        TEXT PRIMARY KEY,
+    branch          TEXT NOT NULL,
+    sha             TEXT,
+    committed_at    TEXT,
+    pushed          INTEGER NOT NULL DEFAULT 0,
+    pushed_at       TEXT,
+    pr_url          TEXT,
+    pr_opened_at    TEXT,
+    reason          TEXT,
+    FOREIGN KEY (draft_id) REFERENCES drafts(id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_drafts_state ON drafts(state);
 CREATE INDEX IF NOT EXISTS idx_drafts_updated ON drafts(updated_at);
 CREATE INDEX IF NOT EXISTS idx_drafts_collection ON drafts(collection);
@@ -105,6 +121,19 @@ class Review:
     reviewer_model: str | None
     reviewer_prompt_hash: str | None
     reviewed_at: str
+
+
+@dataclass
+class Escalation:
+    draft_id: str
+    branch: str
+    sha: str | None
+    committed_at: str | None
+    pushed: bool
+    pushed_at: str | None
+    pr_url: str | None
+    pr_opened_at: str | None
+    reason: str | None
 
 
 def _now() -> str:
@@ -224,6 +253,56 @@ class StateStore:
                 "UPDATE drafts SET state='escalated', updated_at=?, metadata_json=? WHERE id=?",
                 (_now(), json.dumps(meta), draft_id),
             )
+
+    # ── Escalation stages (idempotent) ────────────────────────────
+
+    def record_escalation_commit(
+        self, draft_id: str, branch: str, sha: str | None, reason: str
+    ) -> None:
+        """Record that the escalation branch + commit has been created."""
+        now = _now()
+        with self._tx() as c:
+            c.execute(
+                "INSERT INTO escalations "
+                "(draft_id, branch, sha, committed_at, pushed, reason) "
+                "VALUES (?, ?, ?, ?, 0, ?) "
+                "ON CONFLICT(draft_id) DO UPDATE SET "
+                "branch=excluded.branch, sha=excluded.sha, "
+                "committed_at=excluded.committed_at, reason=excluded.reason",
+                (draft_id, branch, sha, now, reason),
+            )
+
+    def record_escalation_pushed(self, draft_id: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE escalations SET pushed=1, pushed_at=? WHERE draft_id=?",
+                (_now(), draft_id),
+            )
+
+    def record_escalation_pr(self, draft_id: str, pr_url: str) -> None:
+        with self._tx() as c:
+            c.execute(
+                "UPDATE escalations SET pr_url=?, pr_opened_at=? WHERE draft_id=?",
+                (pr_url, _now(), draft_id),
+            )
+
+    def get_escalation(self, draft_id: str) -> Escalation | None:
+        row = self._conn.execute(
+            "SELECT * FROM escalations WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return Escalation(
+            draft_id=row["draft_id"],
+            branch=row["branch"],
+            sha=row["sha"],
+            committed_at=row["committed_at"],
+            pushed=bool(row["pushed"]),
+            pushed_at=row["pushed_at"],
+            pr_url=row["pr_url"],
+            pr_opened_at=row["pr_opened_at"],
+            reason=row["reason"],
+        )
 
     def abandon(self, draft_id: str, reason: str) -> None:
         draft = self.get_draft(draft_id)

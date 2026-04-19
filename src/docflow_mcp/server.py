@@ -53,6 +53,11 @@ def _init() -> tuple[Config, StateStore, Committer]:
     global _cfg, _store, _committer
     if _cfg is None:
         _cfg = Config.from_env()
+        # Validate on first use so daemon startup fails fast on bad paths.
+        # Warnings are surfaced via logs and list_collections output, not errors.
+        warnings = _cfg.validate()
+        for w in warnings:
+            print(f"[docflow config] WARN: {w}")
     if _store is None:
         _store = StateStore(_cfg.state_dir)
     if _committer is None:
@@ -180,7 +185,7 @@ def list_collections() -> str:
     lines = []
     for name in sorted(cfg.collections):
         c = cfg.collections[name]
-        lines.append(f"{name}")
+        lines.append(f"{name}  (git: {c.git_mode})")
         lines.append(f"  docs_root: {c.docs_root}")
         if c.scope_map:
             lines.append("  scopes:")
@@ -518,7 +523,8 @@ def commit(collection: str, draft_id: str) -> str:
 
     try:
         result = committer.commit_direct(
-            repo=scope_repo, target_path=target, content=content, message=msg
+            repo=scope_repo, target_path=target, content=content, message=msg,
+            git_mode=coll.git_mode,
         )
     except Exception as e:
         return f"ERROR committing: {e}"
@@ -560,8 +566,11 @@ def escalate(collection: str, draft_id: str, reason: str) -> str:
         return f"ERROR: draft is '{d.state}' and cannot be escalated."
 
     content = store.get_content(draft_id)
-    response: dict[str, Any] = {"draft_id": draft_id, "collection": collection, "reason": reason}
+    response: dict[str, Any] = {
+        "draft_id": draft_id, "collection": collection, "reason": reason
+    }
 
+    # Stale-kind drafts go to Plane, not git. No git_mode dependency.
     if d.kind == "stale":
         title_line = next(
             (line.strip() for line in content.splitlines() if line.strip()),
@@ -575,50 +584,121 @@ def escalate(collection: str, draft_id: str, reason: str) -> str:
         )
         url = open_stale_issue(title=title, body=body, project_id=cfg.plane_stale_project)
         response["plane_issue"] = url or "Plane not configured; no issue created."
+        store.mark_escalated(draft_id, reason=reason)
+        response["state"] = "escalated"
+        return json.dumps(response, indent=2)
+
+    # Decision / section escalations create a branch + commit, then push + PR.
+    # The three stages are recorded in the escalations table so retries skip
+    # work that's already done.
+
+    if coll.git_mode == "disabled":
+        return (
+            f"ERROR: collection '{collection}' has git_mode='disabled'; "
+            "escalate requires a git-tracked collection so the draft can "
+            "be preserved on a branch for human review."
+        )
+
+    try:
+        scope_repo = coll.resolve_scope(d.scope)
+    except ValueError as e:
+        return f"ERROR: {e}"
+
+    if not (scope_repo / ".git").exists():
+        return (
+            f"ERROR: scope repo {scope_repo} is not a git repository; "
+            "escalate requires git."
+        )
+
+    existing = store.get_escalation(draft_id)
+    branch = existing.branch if existing else f"docs/agent-{draft_id}"
+
+    if d.kind == "decision":
+        title = extract_title(content)
+        target = resolve_decision_path(
+            scope_repo, title, number_sources=_all_decisions_dirs(cfg)
+        )
+        msg = f"docs: escalated ADR draft — {title}"
+        pr_title = f"[docs-escalated] ADR: {title}"
     else:
+        if not d.path:
+            return "ERROR: section draft has no target path."
         try:
-            scope_repo = coll.resolve_scope(d.scope)
-        except ValueError as e:
+            target = resolve_section_path(scope_repo, d.path)
+        except (FileNotFoundError, ValueError) as e:
             return f"ERROR: {e}"
+        msg = f"docs: escalated section update — {d.path}"
+        pr_title = f"[docs-escalated] section: {d.path}"
 
-        branch = f"docs/agent-{draft_id}"
-        if d.kind == "decision":
-            title = extract_title(content)
-            target = resolve_decision_path(
-                scope_repo, title, number_sources=_all_decisions_dirs(cfg)
-            )
-            msg = f"docs: escalated ADR draft — {title}"
-            pr_title = f"[docs-escalated] ADR: {title}"
-        else:
-            if not d.path:
-                return "ERROR: section draft has no target path."
-            try:
-                target = resolve_section_path(scope_repo, d.path)
-            except (FileNotFoundError, ValueError) as e:
-                return f"ERROR: {e}"
-            msg = f"docs: escalated section update — {d.path}"
-            pr_title = f"[docs-escalated] section: {d.path}"
-
+    # Stage 1: commit on branch (skip if already done and content unchanged)
+    if existing is None or not existing.sha:
         try:
             result = committer.commit_on_branch(
                 repo=scope_repo, target_path=target, content=content,
-                message=msg, branch=branch,
+                message=msg, branch=branch, git_mode=coll.git_mode,
             )
         except Exception as e:
             return f"ERROR preparing branch: {e}"
+        store.record_escalation_commit(
+            draft_id=draft_id, branch=result.branch or branch,
+            sha=result.sha, reason=reason,
+        )
+        response["branch"] = result.branch
+        response["sha"] = result.sha
+    else:
+        response["branch"] = existing.branch
+        response["sha"] = existing.sha
+        response["note"] = "branch + commit already recorded from prior attempt"
 
+    # Stage 2: push (skip if already pushed OR git_mode=local)
+    if coll.git_mode != "remote":
+        response["pr"] = "git_mode is 'local'; branch kept locally, no push/PR attempted"
+        store.mark_escalated(draft_id, reason=reason)
+        response["state"] = "escalated"
+        return json.dumps(response, indent=2)
+
+    # git_mode == remote from here on.
+    ok_auth, auth_detail = committer.gh_auth_ok()
+    if not ok_auth:
+        response["push"] = "skipped"
+        response["pr"] = f"skipped — gh not authenticated ({auth_detail}). Run `gh auth login`."
+        store.mark_escalated(draft_id, reason=reason)
+        response["state"] = "escalated"
+        return json.dumps(response, indent=2)
+
+    current = store.get_escalation(draft_id)
+    if not current or not current.pushed:
+        ok_push, push_detail = committer.push_branch(scope_repo, branch)
+        if not ok_push:
+            response["push"] = push_detail
+            store.mark_escalated(draft_id, reason=reason)
+            response["state"] = "escalated"
+            return json.dumps(response, indent=2)
+        store.record_escalation_pushed(draft_id)
+        response["push"] = "pushed to origin"
+    else:
+        response["push"] = "already pushed from prior attempt"
+
+    # Stage 3: open PR (skip if URL already recorded)
+    current = store.get_escalation(draft_id)
+    if current and current.pr_url:
+        response["pr"] = current.pr_url
+        response["pr_note"] = "already opened from prior attempt"
+    else:
         pr_body = (
             f"Agent-authored draft requiring human review.\n\n"
             f"**Reason:** {reason}\n\n"
             f"Collection: `{collection}`  \nDraft id: `{draft_id}`  \n"
             f"Iterations: {d.iteration + 1}  \nScope: {d.scope}\n"
         )
-        pr_url = committer.open_draft_pr(
+        ok_pr, pr_detail = committer.open_pr(
             repo=scope_repo, branch=branch, title=pr_title, body=pr_body
         )
-        response["branch"] = result.branch
-        response["sha"] = result.sha
-        response["pr"] = pr_url or "gh CLI unavailable; branch pushed locally."
+        if ok_pr:
+            store.record_escalation_pr(draft_id, pr_detail)
+            response["pr"] = pr_detail
+        else:
+            response["pr"] = pr_detail
 
     store.mark_escalated(draft_id, reason=reason)
     response["state"] = "escalated"

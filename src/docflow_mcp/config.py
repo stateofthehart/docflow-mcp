@@ -39,11 +39,15 @@ def _package_prompts_dir() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "prompts"
 
 
+GitMode = str  # Literal["remote", "local", "disabled"]  — kept as str for json compat
+
+
 @dataclass(frozen=True)
 class CollectionConfig:
     name: str
     docs_root: Path
     scope_map: dict[str, Path] = field(default_factory=dict)
+    git_mode: GitMode = "remote"
 
     def resolve_scope(self, scope: str) -> Path:
         """Return the repository path for a scope label within this collection.
@@ -100,10 +104,17 @@ class Config:
                 k: Path(v).expanduser().resolve()
                 for k, v in (entry.get("scope_map") or {}).items()
             }
+            git_mode = (entry.get("git") or "remote").strip().lower()
+            if git_mode not in ("remote", "local", "disabled"):
+                raise RuntimeError(
+                    f"{path}: collection '{name}' has invalid git: '{git_mode}'. "
+                    "Must be one of: remote, local, disabled."
+                )
             collections[name] = CollectionConfig(
                 name=name,
                 docs_root=Path(entry["docs_root"]).expanduser().resolve(),
                 scope_map=scope_map,
+                git_mode=git_mode,
             )
 
         state_dir = Path(
@@ -177,6 +188,66 @@ class Config:
 
     def known_collections(self) -> list[str]:
         return sorted(self.collections)
+
+    def validate(self) -> list[str]:
+        """Run sanity checks across every collection. Returns a list of warnings.
+
+        Raises RuntimeError if anything is unrecoverable (missing docs_root).
+        Git-mode mismatches are returned as warnings so a collection with a
+        misdeclared git_mode doesn't take down the daemon for other collections.
+        """
+        import subprocess
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        for name, coll in self.collections.items():
+            if not coll.docs_root.exists():
+                errors.append(
+                    f"collection '{name}': docs_root does not exist: {coll.docs_root}"
+                )
+                continue
+            if not coll.docs_root.is_dir():
+                errors.append(
+                    f"collection '{name}': docs_root is not a directory: {coll.docs_root}"
+                )
+                continue
+
+            if coll.git_mode in ("remote", "local"):
+                if not (coll.docs_root / ".git").exists():
+                    warnings.append(
+                        f"collection '{name}': git_mode={coll.git_mode} but "
+                        f"{coll.docs_root} is not a git repo; commits will fail "
+                        f"until initialized or git_mode is set to disabled."
+                    )
+
+            if coll.git_mode == "remote":
+                # Check for a remote named 'origin'
+                try:
+                    res = subprocess.run(
+                        ["git", "-C", str(coll.docs_root), "remote"],
+                        capture_output=True, text=True, timeout=5, check=False,
+                    )
+                    if res.returncode == 0 and "origin" not in res.stdout.split():
+                        warnings.append(
+                            f"collection '{name}': git_mode=remote but no 'origin' "
+                            "remote configured; push + PR creation will fail."
+                        )
+                except (subprocess.SubprocessError, FileNotFoundError):
+                    pass  # already captured by earlier .git existence check
+
+            for scope_name, scope_path in coll.scope_map.items():
+                if not scope_path.exists():
+                    warnings.append(
+                        f"collection '{name}' scope '{scope_name}': path does not "
+                        f"exist: {scope_path}"
+                    )
+
+        if errors:
+            msg = "docflow config has unrecoverable errors:\n  " + "\n  ".join(errors)
+            if warnings:
+                msg += "\n\nWarnings:\n  " + "\n  ".join(warnings)
+            raise RuntimeError(msg)
+        return warnings
 
 
 def _parse_config_text(text: str, path: Path) -> dict:
