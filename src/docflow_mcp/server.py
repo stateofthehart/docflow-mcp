@@ -138,7 +138,7 @@ def _resolve_collection(collection: str | None) -> str:
 @mcp.tool
 def search(
     query: str,
-    collection: str | None = None,
+    collection: str = "",
     category: str | None = None,
     limit: int = 25,
 ) -> str:
@@ -146,8 +146,11 @@ def search(
 
     Args:
         query: search terms.
-        collection: which collection to search. Falls back to the
-            X-Docflow-Collection header if not passed.
+        collection: collection name to search. Leave empty ("") to use
+            this client's default (from X-Docflow-Collection header).
+            Pass a specific name like "homelab-docs" to override the
+            default — this is how you cross into a different collection
+            from a session whose default is something else.
         category: optional subdir under docs/ (e.g. "decisions").
         limit: max hits.
     """
@@ -168,7 +171,7 @@ def search(
 
 @mcp.tool
 def read(
-    path: str, collection: str | None = None, section: str | None = None
+    path: str, collection: str = "", section: str | None = None
 ) -> str:
     """Read a doc file in a collection, optionally scoped to one heading.
 
@@ -188,7 +191,7 @@ def read(
 
 @mcp.tool
 def list_docs(
-    collection: str | None = None,
+    collection: str = "",
     category: str | None = None,
     changed_since_days: int | None = None,
 ) -> str:
@@ -209,7 +212,7 @@ def list_docs(
 
 
 @mcp.tool
-def recent(collection: str | None = None, limit: int = 10) -> str:
+def recent(collection: str = "", limit: int = 10) -> str:
     """Recent commits that touched any docs file in this collection.
 
     `collection` falls back to the X-Docflow-Collection header.
@@ -268,7 +271,7 @@ def draft(
     kind: str,
     scope: str,
     content: str,
-    collection: str | None = None,
+    collection: str = "",
     path: str | None = None,
     reason: str | None = None,
 ) -> str:
@@ -327,7 +330,7 @@ def draft(
 
 
 @mcp.tool
-def prepare_review(draft_id: str, collection: str | None = None) -> str:
+def prepare_review(draft_id: str, collection: str = "") -> str:
     """Return a self-contained review bundle for a draft.
 
     Output is JSON with: system_prompt, prompt_hash, working_dir, task,
@@ -443,7 +446,7 @@ def prepare_review(draft_id: str, collection: str | None = None) -> str:
 def submit_review(
     draft_id: str,
     verdict: str,
-    collection: str | None = None,
+    collection: str = "",
     issues: list[dict] | None = None,
     notes: str | None = None,
     reviewer_model: str | None = None,
@@ -513,7 +516,7 @@ def submit_review(
 
 
 @mcp.tool
-def revise(draft_id: str, content: str, collection: str | None = None) -> str:
+def revise(draft_id: str, content: str, collection: str = "") -> str:
     """Submit a revised version. Increments iteration, resets to drafting.
 
     `collection` falls back to the X-Docflow-Collection header.
@@ -548,7 +551,7 @@ def revise(draft_id: str, content: str, collection: str | None = None) -> str:
 
 
 @mcp.tool
-def commit(draft_id: str, collection: str | None = None) -> str:
+def commit(draft_id: str, collection: str = "") -> str:
     """Commit a draft to its scope repository. Gated: latest review must be approve.
 
     `collection` falls back to the X-Docflow-Collection header.
@@ -637,7 +640,7 @@ def commit(draft_id: str, collection: str | None = None) -> str:
 
 
 @mcp.tool
-def escalate(draft_id: str, reason: str, collection: str | None = None) -> str:
+def escalate(draft_id: str, reason: str, collection: str = "") -> str:
     """Mark a draft as requiring human review.
 
     `collection` falls back to the X-Docflow-Collection header.
@@ -803,7 +806,7 @@ def escalate(draft_id: str, reason: str, collection: str | None = None) -> str:
 
 @mcp.tool
 def status(
-    collection: str | None = None,
+    collection: str = "",
     draft_id: str | None = None,
     state: str | None = None,
 ) -> str:
@@ -833,7 +836,7 @@ def status(
 
 
 @mcp.tool
-def abandon(draft_id: str, reason: str, collection: str | None = None) -> str:
+def abandon(draft_id: str, reason: str, collection: str = "") -> str:
     """Abandon a draft.
 
     `collection` falls back to the X-Docflow-Collection header.
@@ -863,14 +866,25 @@ _ = slugify
 def main() -> None:
     import sys
     if "--http" in sys.argv:
-        # Streamable HTTP daemon mode
+        # Streamable HTTP daemon mode.
+        #
+        # stateless_http=True means every request is independent — no
+        # server-side session IDs. When the daemon restarts, existing
+        # clients don't see "Session not found" errors; they just pick
+        # up on the next request. docflow's tools are pure functions of
+        # their args + on-disk state, so we gain nothing from sessions.
         port = 8422
         host = "127.0.0.1"
         if "--port" in sys.argv:
             port = int(sys.argv[sys.argv.index("--port") + 1])
         if "--host" in sys.argv:
             host = sys.argv[sys.argv.index("--host") + 1]
-        mcp.run(transport="streamable-http", host=host, port=port)
+        mcp.run(
+            transport="streamable-http",
+            host=host,
+            port=port,
+            stateless_http=True,
+        )
     else:
         mcp.run()  # stdio (default)
 
