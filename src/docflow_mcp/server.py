@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_http_headers
 
 from .committer import Committer
 from .config import CollectionConfig, Config
@@ -97,6 +98,38 @@ def _prompt_for_kind(prompts_dir: Path, kind: str) -> tuple[str, str]:
     return text, digest
 
 
+_COLLECTION_HEADER = "x-docflow-collection"
+
+
+def _header_collection() -> str | None:
+    """Return the X-Docflow-Collection header value, if any.
+
+    Safe to call without an active HTTP request (returns None). stdio clients
+    always see None here, which means they must pass `collection=` explicitly.
+    """
+    headers = get_http_headers()
+    # HTTP header names are case-insensitive; fastmcp normalizes to lowercase.
+    return headers.get(_COLLECTION_HEADER) or None
+
+
+def _resolve_collection(collection: str | None) -> str:
+    """Resolve the collection for a tool call.
+
+    Precedence: explicit argument > X-Docflow-Collection header.
+    Raises ValueError when neither source supplies a value.
+    """
+    if collection:
+        return collection
+    header_default = _header_collection()
+    if header_default:
+        return header_default
+    raise ValueError(
+        "collection is required — pass as a tool argument or configure the "
+        "X-Docflow-Collection header on this client's MCP registration "
+        "(see docflow README for setup)"
+    )
+
+
 # ─────────────────────────────────────────────────────────────────
 # Read-side tools
 # ─────────────────────────────────────────────────────────────────
@@ -104,18 +137,23 @@ def _prompt_for_kind(prompts_dir: Path, kind: str) -> tuple[str, str]:
 
 @mcp.tool
 def search(
-    collection: str, query: str, category: str | None = None, limit: int = 25
+    query: str,
+    collection: str | None = None,
+    category: str | None = None,
+    limit: int = 25,
 ) -> str:
     """Full-text search over one collection's docs.
 
     Args:
-        collection: which collection to search (see list_collections).
         query: search terms.
-        category: optional subdir under docs/ to scope to (e.g. "decisions").
+        collection: which collection to search. Falls back to the
+            X-Docflow-Collection header if not passed.
+        category: optional subdir under docs/ (e.g. "decisions").
         limit: max hits.
     """
     cfg, _, _ = _init()
     try:
+        collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -129,10 +167,16 @@ def search(
 
 
 @mcp.tool
-def read(collection: str, path: str, section: str | None = None) -> str:
-    """Read a doc file in a collection, optionally scoped to one heading."""
+def read(
+    path: str, collection: str | None = None, section: str | None = None
+) -> str:
+    """Read a doc file in a collection, optionally scoped to one heading.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, _, _ = _init()
     try:
+        collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -144,13 +188,17 @@ def read(collection: str, path: str, section: str | None = None) -> str:
 
 @mcp.tool
 def list_docs(
-    collection: str,
+    collection: str | None = None,
     category: str | None = None,
     changed_since_days: int | None = None,
 ) -> str:
-    """List markdown docs in a collection, optionally filtered."""
+    """List markdown docs in a collection, optionally filtered.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, _, _ = _init()
     try:
+        collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -161,10 +209,14 @@ def list_docs(
 
 
 @mcp.tool
-def recent(collection: str, limit: int = 10) -> str:
-    """Recent commits that touched any docs file in this collection."""
+def recent(collection: str | None = None, limit: int = 10) -> str:
+    """Recent commits that touched any docs file in this collection.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, _, _ = _init()
     try:
+        collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -178,19 +230,31 @@ def recent(collection: str, limit: int = 10) -> str:
 
 @mcp.tool
 def list_collections() -> str:
-    """List every configured collection with its docs_root and scope map."""
+    """List every configured collection with its docs_root and scope map.
+
+    Marks the current client's default collection (from the
+    X-Docflow-Collection header) with an asterisk.
+    """
     cfg, _, _ = _init()
     if not cfg.collections:
         return "No collections configured."
+    default = _header_collection()
     lines = []
     for name in sorted(cfg.collections):
         c = cfg.collections[name]
-        lines.append(f"{name}  (git: {c.git_mode})")
+        star = " *" if name == default else ""
+        lines.append(f"{name}  (git: {c.git_mode}){star}")
         lines.append(f"  docs_root: {c.docs_root}")
         if c.scope_map:
             lines.append("  scopes:")
             for s, p in sorted(c.scope_map.items()):
                 lines.append(f"    {s} -> {p}")
+    if default:
+        lines.append("")
+        lines.append(
+            f"* = default collection for this client (via X-Docflow-Collection "
+            f"header = '{default}'). Pass `collection=` explicitly to override."
+        )
     return "\n".join(lines)
 
 
@@ -201,20 +265,21 @@ def list_collections() -> str:
 
 @mcp.tool
 def draft(
-    collection: str,
     kind: str,
     scope: str,
     content: str,
+    collection: str | None = None,
     path: str | None = None,
     reason: str | None = None,
 ) -> str:
     """Stage a new draft in a collection.
 
     Args:
-        collection: which collection to draft in.
         kind: "decision", "section", or "stale".
         scope: "cross-repo" or a name from the collection's scope_map.
         content: the draft body.
+        collection: which collection to draft in. Falls back to the
+            X-Docflow-Collection header.
         path: required for kind="section".
         reason: recommended for "section" and "stale".
     """
@@ -222,6 +287,7 @@ def draft(
     if kind not in ("decision", "section", "stale"):
         return f"ERROR: unknown kind '{kind}'. Use 'decision', 'section', or 'stale'."
     try:
+        collection = _resolve_collection(collection)
         coll = cfg.resolve_collection(collection)
         coll.resolve_scope(scope)
     except ValueError as e:
@@ -261,16 +327,19 @@ def draft(
 
 
 @mcp.tool
-def prepare_review(collection: str, draft_id: str) -> str:
+def prepare_review(draft_id: str, collection: str | None = None) -> str:
     """Return a self-contained review bundle for a draft.
 
     Output is JSON with: system_prompt, prompt_hash, working_dir, task,
     suggested_profile. Caller hands system_prompt + task to its own
     sub-agent spawner (e.g. myllm.spawn_agent) with working_dir pointing
     at the collection's docs_root.
+
+    `collection` falls back to the X-Docflow-Collection header.
     """
     cfg, store, _ = _init()
     try:
+        collection = _resolve_collection(collection)
         coll, reader = _reader_for(cfg, collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -372,16 +441,23 @@ def prepare_review(collection: str, draft_id: str) -> str:
 
 @mcp.tool
 def submit_review(
-    collection: str,
     draft_id: str,
     verdict: str,
+    collection: str | None = None,
     issues: list[dict] | None = None,
     notes: str | None = None,
     reviewer_model: str | None = None,
     prompt_hash: str | None = None,
 ) -> str:
-    """Record an externally-produced review verdict."""
+    """Record an externally-produced review verdict.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, store, _ = _init()
+    try:
+        collection = _resolve_collection(collection)
+    except ValueError as e:
+        return f"ERROR: {e}"
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
@@ -437,9 +513,16 @@ def submit_review(
 
 
 @mcp.tool
-def revise(collection: str, draft_id: str, content: str) -> str:
-    """Submit a revised version. Increments iteration, resets to drafting."""
+def revise(draft_id: str, content: str, collection: str | None = None) -> str:
+    """Submit a revised version. Increments iteration, resets to drafting.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     _, store, _ = _init()
+    try:
+        collection = _resolve_collection(collection)
+    except ValueError as e:
+        return f"ERROR: {e}"
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
@@ -465,10 +548,14 @@ def revise(collection: str, draft_id: str, content: str) -> str:
 
 
 @mcp.tool
-def commit(collection: str, draft_id: str) -> str:
-    """Commit a draft to its scope repository. Gated: latest review must be approve."""
+def commit(draft_id: str, collection: str | None = None) -> str:
+    """Commit a draft to its scope repository. Gated: latest review must be approve.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, store, committer = _init()
     try:
+        collection = _resolve_collection(collection)
         coll = cfg.resolve_collection(collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -550,10 +637,14 @@ def commit(collection: str, draft_id: str) -> str:
 
 
 @mcp.tool
-def escalate(collection: str, draft_id: str, reason: str) -> str:
-    """Mark a draft as requiring human review."""
+def escalate(draft_id: str, reason: str, collection: str | None = None) -> str:
+    """Mark a draft as requiring human review.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     cfg, store, committer = _init()
     try:
+        collection = _resolve_collection(collection)
         coll = cfg.resolve_collection(collection)
     except ValueError as e:
         return f"ERROR: {e}"
@@ -742,9 +833,16 @@ def status(
 
 
 @mcp.tool
-def abandon(collection: str, draft_id: str, reason: str) -> str:
-    """Abandon a draft."""
+def abandon(draft_id: str, reason: str, collection: str | None = None) -> str:
+    """Abandon a draft.
+
+    `collection` falls back to the X-Docflow-Collection header.
+    """
     _, store, _ = _init()
+    try:
+        collection = _resolve_collection(collection)
+    except ValueError as e:
+        return f"ERROR: {e}"
     d = store.get_draft(draft_id)
     if d is None:
         return f"ERROR: no draft '{draft_id}'"
