@@ -404,15 +404,43 @@ def prepare_review(draft_id: str, collection: str = "") -> str:
             )
         except (FileNotFoundError, ValueError):
             pass
+
+    # Scope-aware sandbox: for cross-repo drafts the reviewer reads from the
+    # docs collection itself. For sub-repo-scoped drafts the sandbox becomes
+    # the target sub-repo, so the reviewer can verify code-level claims
+    # against the actual implementation. Trade: loses visibility into the
+    # central docs collection for sub-repo drafts — the author should embed
+    # cross-collection references in the task text rather than expect the
+    # reviewer to fetch them.
+    if d.scope in ("cross-repo", "", "default"):
+        working_dir = coll.docs_root
+        sandbox_note = (
+            "Your working directory is the central docs collection. You can "
+            "read any file under docs/ — decisions, contracts, architecture, "
+            "specs. Ground-truth code claims should be treated with skepticism "
+            "unless the author embedded axon / code-read evidence in the draft."
+        )
+    else:
+        try:
+            working_dir = coll.resolve_scope(d.scope)
+        except ValueError:
+            working_dir = coll.docs_root  # fallback; shouldn't happen
+        sandbox_note = (
+            f"Your working directory is the target sub-repo for this draft "
+            f"(scope={d.scope}). You can read its code and its own docs/ tree "
+            f"to verify target-side claims. You CANNOT read the central docs "
+            f"collection from this sandbox — if the author references ADRs, "
+            f"contracts, or files outside this sub-repo, trust embedded "
+            f"evidence (verbatim quotes, SHA sums, supersedes links) rather "
+            f"than flagging them as unverifiable."
+        )
+
     task_parts.extend(
         [
             "## Reviewer working directory",
-            f"{coll.docs_root}",
+            f"{working_dir}",
             "",
-            "Use your read_file / list_files / grep tools to explore related",
-            "docs if needed. Your working directory is sandboxed to this path.",
-            "Code-graph claims should be treated with skepticism unless the",
-            "author embedded verification results above.",
+            sandbox_note,
             "",
             "Output your review strictly as the YAML block specified in your",
             "system prompt. No prose outside the YAML block.",
@@ -427,12 +455,12 @@ def prepare_review(draft_id: str, collection: str = "") -> str:
             "kind": d.kind,
             "system_prompt": prompt_text,
             "prompt_hash": prompt_hash,
-            "working_dir": str(coll.docs_root),
+            "working_dir": str(working_dir),
             "task": "\n".join(task_parts),
             "suggested_profile": "docs-reviewer",
             "next_step": (
                 f"Pass system_prompt + task to your sub-agent spawner with "
-                f"working_dir='{coll.docs_root}'. Then call "
+                f"working_dir='{working_dir}'. Then call "
                 f"`submit_review(collection='{collection}', draft_id='{draft_id}', "
                 f"verdict=..., issues=..., notes=..., reviewer_model=..., "
                 f"prompt_hash='{prompt_hash}')`."

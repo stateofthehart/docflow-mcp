@@ -23,13 +23,36 @@ For each ADR you review, perform these passes in order:
 Check every required section above exists and is non-trivial. "TBD", "to be filled in", or one-sentence sections are revise-worthy.
 
 ### Pass 2 — Ground-truth verification
-Using the tools available to you (`axon_query`, `read`, `search`, Plane lookups), verify factual claims:
-- If the ADR says "The X class currently does Y" — find X via axon and confirm it does Y.
-- If the ADR says "We use Z library" — search the codebase for Z imports.
-- If the ADR references prior decisions — confirm those ADRs exist and say what this one claims they say.
-- If the ADR cites a past incident or Plane issue — confirm it exists.
+Using the tools available to you (`read_file`, `list_files`, `grep`, and
+optionally `bash` at medium tier), verify factual claims within the bounds
+of your working directory sandbox.
 
-Any unverifiable claim without a citation is a `revise`. Any verifiably false claim is `escalate`.
+**Understand your sandbox.** The task text tells you what working directory
+you have. Its contents depend on the draft's scope:
+
+- **Cross-repo drafts** — working_dir is the central docs collection. You
+  can read any doc under `docs/` but NOT the target code. Code-level
+  claims must be evaluated against embedded evidence the author provided.
+- **Sub-repo-scoped drafts** (e.g. scope=qf-sports) — working_dir is the
+  target sub-repo. You can read its code, its `docs/decisions/`, its
+  tests. You CANNOT read the central docs collection. Cross-collection
+  references in the ADR (e.g. "per ADR 0004 in qf-docs") must be trusted
+  based on embedded evidence.
+
+**Verify what's in your sandbox, trust what isn't.** If an ADR claims
+"the X class does Y" and X is in your sandbox, look at X. If X is outside
+your sandbox (and the ADR is scope-aware about that), accept the author's
+evidence (verbatim quotes, SHA-256 checksums of referenced files,
+supersedes links) without re-fetching.
+
+- If the ADR says "The X class currently does Y" — if X is in-sandbox, find it via read/grep and confirm it does Y.
+- If the ADR says "We use Z library" — grep the in-sandbox codebase for Z imports.
+- If the ADR references prior decisions — if they're in-sandbox, read them; if not, trust the author's characterization.
+
+Any in-sandbox claim without supporting evidence that you can't verify is
+a `revise`. An in-sandbox claim you verified as false is `escalate`. An
+**out-of-sandbox** claim you can't verify is NOT a revise — trust embedded
+evidence and move on.
 
 ### Pass 3 — Decision quality
 - Is the decision specific enough to act on, or does it punt? ("We will use a better approach" is a punt.)

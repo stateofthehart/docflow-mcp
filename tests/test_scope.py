@@ -25,6 +25,27 @@ def test_slugify_empty_fallback():
     assert slugify("!!!") == "untitled"
 
 
+def test_slugify_collapses_double_hyphens():
+    """A title like 'pip install -e .' should not leak '--e-' into the slug."""
+    assert slugify("Use `uv sync` over `pip install -e .`") == "use-uv-sync-over-pip-install-e"
+
+
+def test_slugify_strips_adr_nnnn_placeholder_prefix():
+    """Slug shouldn't leak 'adr-nnnn-' when the title was left as a placeholder."""
+    assert slugify("ADR NNNN: Isolate live tests") == "isolate-live-tests"
+
+
+def test_slugify_strips_numeric_adr_prefix_too():
+    """Same treatment for real numeric ADR prefixes that slipped through."""
+    assert slugify("ADR 7: Use ISO 8601") == "use-iso-8601"
+
+
+def test_slugify_preserves_real_words_starting_with_adr():
+    """'adr-based' at title start is a real word, should not be stripped."""
+    # This tests that the adr-prefix strip only fires on 'adr-<TOKEN>-' shape
+    assert slugify("adroit solution") == "adroit-solution"
+
+
 def test_next_adr_number_empty_dir(tmp_path: Path):
     d = tmp_path / "decisions"
     d.mkdir()
@@ -91,6 +112,15 @@ def test_resolve_section_path_refuses_escape(tmp_repo: Path):
 
 def test_extract_title_adr_format():
     assert extract_title("# ADR 0003: Arrow IPC\n\n...") == "Arrow IPC"
+
+
+def test_extract_title_adr_nnnn_placeholder():
+    """Authors often leave 'ADR NNNN:' as placeholder since docflow renumbers."""
+    assert extract_title("# ADR NNNN: Isolate live tests\n\n") == "Isolate live tests"
+
+
+def test_extract_title_adr_xxx_placeholder():
+    assert extract_title("# ADR XXX: Some decision\n") == "Some decision"
 
 
 def test_extract_title_plain_format():

@@ -20,12 +20,23 @@ Does the report cite specific evidence, or is it a vibe?
 Reports without specific, verifiable evidence should be `revise` — ask the author to investigate further before opening a Plane issue.
 
 ### Pass 2 — Independent verification
-Using tools, verify the staleness claim yourself:
-- If the report says "X was renamed to Y" — confirm via `axon_query`, `search`, and git history.
-- If the report says "this contradicts ADR NNNN" — read the ADR and confirm the contradiction exists.
-- If the report says "this references a deprecated feature" — confirm the deprecation via changelog or code.
 
-You MUST attempt verification. Do not take the author's word.
+**Understand your sandbox.** Your working directory depends on the
+draft's scope — cross-repo drafts sandbox you to the central docs
+collection; sub-repo-scoped drafts sandbox you to the target sub-repo.
+Attempt verification against files in your sandbox. For out-of-sandbox
+references, require the author to provide embedded evidence (verbatim
+quotes, SHA sums, git SHA references) and evaluate that evidence rather
+than flag as unverifiable.
+
+Using `read_file`, `list_files`, `grep`, verify the staleness claim:
+- If the report says "X was renamed to Y" — if X is in-sandbox, confirm via read/grep. Out-of-sandbox: require author's git-log or commit reference.
+- If the report says "this contradicts ADR NNNN" — if the ADR is in-sandbox, read it and confirm. Out-of-sandbox: require author to quote the contradicting passage verbatim.
+- If the report says "this references a deprecated feature" — if the code is in-sandbox, confirm deprecation. Out-of-sandbox: require author's changelog citation.
+
+You MUST attempt verification for in-sandbox claims. For out-of-sandbox
+claims, evaluate the embedded evidence but do not reject for
+"unverifiable" if evidence is solid.
 
 ### Pass 3 — Staleness vs ambiguity vs preference
 Classify the nature of the issue:

@@ -23,8 +23,23 @@ from pathlib import Path
 
 
 def slugify(title: str) -> str:
+    """Turn a title into a filename-safe slug.
+
+    Strips a leading `adr-<token>-` prefix so placeholder titles like
+    "ADR NNNN: Foo" don't leak `adr-nnnn-` into filenames when the title
+    wasn't already cleaned via extract_title. Also collapses runs of
+    dashes (which otherwise leak from tokens like `-e` or `foo/bar`).
+    """
     slug = re.sub(r"[^a-zA-Z0-9\s-]", "", title.lower())
-    slug = re.sub(r"\s+", "-", slug).strip("-")
+    slug = re.sub(r"\s+", "-", slug)
+    # Collapse consecutive dashes: "pip-install--e" → "pip-install-e"
+    slug = re.sub(r"-+", "-", slug)
+    # Strip leading "adr-<anything>-" prefix (handles numeric ADR numbers
+    # and placeholder tokens like NNNN / XXX that authors sometimes leave
+    # in drafts). Uses a single token (no embedded dashes) so "adr-based"
+    # at the start of a genuine title isn't collapsed.
+    slug = re.sub(r"^adr-[a-z0-9]+-", "", slug)
+    slug = slug.strip("-")
     return slug[:60] or "untitled"
 
 
@@ -91,12 +106,17 @@ def resolve_section_path(scope_repo: Path, rel_path: str) -> Path:
 
 
 def extract_title(content: str) -> str:
-    """Extract an ADR title from `# ADR NNNN: Title` or `# Title` line."""
+    """Extract an ADR title from `# ADR NNNN: Title` or `# Title` line.
+
+    Strips both real numeric ADR numbers (`ADR 123:`) and placeholder
+    tokens authors sometimes leave in drafts (`ADR NNNN:`, `ADR XXX:`).
+    """
     for line in content.splitlines():
         line = line.strip()
         if line.startswith("# "):
             title = line[2:].strip()
-            # Strip ADR numbering if present
-            m = re.match(r"^ADR\s+\d+:\s*(.*)$", title, re.IGNORECASE)
+            # Strip `ADR <token>:` prefix where <token> is a single
+            # alphanumeric run — matches "123", "NNNN", "XXX", etc.
+            m = re.match(r"^ADR\s+[A-Z0-9]+\s*:\s*(.*)$", title, re.IGNORECASE)
             return m.group(1).strip() if m else title
     return "untitled"

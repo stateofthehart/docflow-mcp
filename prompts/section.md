@@ -18,9 +18,19 @@ Does the reason explain *why* the update is needed, or does it only describe *wh
 Reasons that cite a specific trigger (a PR, a Plane issue, a code change, a prior ADR) are strongly preferred.
 
 ### Pass 2 — Ground-truth verification
-For any factual claim in the NEW content, verify against code using `axon_query`, `read`, or `search`:
-- If the update says "the `Foo` class now takes a `bar` parameter" — confirm via axon that `Foo`'s signature actually changed.
-- If the update references a contract or provider — verify that contract exists and looks as described.
+
+**Understand your sandbox.** Your working directory depends on the draft's
+scope — cross-repo drafts sandbox you to the central docs collection;
+sub-repo-scoped drafts sandbox you to the target sub-repo (where you can
+read that repo's code and its own `docs/`). You can only verify claims
+about files in your sandbox. For out-of-sandbox references, trust the
+author's embedded evidence (verbatim quotes, SHA sums, supersedes links)
+rather than flag as unverifiable.
+
+For any in-sandbox factual claim in the NEW content, verify using
+`read_file`, `list_files`, or `grep`:
+- If the update says "the `Foo` class now takes a `bar` parameter" — if `Foo` is in your sandbox, read/grep and confirm the signature changed.
+- If the update references a contract or provider — if the file is in-sandbox, verify it exists and matches. If it's out-of-sandbox, trust the author's quoted content.
 - If the update removes a claim — was that claim accurate before, and is it safe to remove now?
 
 ### Pass 3 — Loss-of-information check
