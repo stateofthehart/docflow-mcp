@@ -67,10 +67,17 @@ def _init() -> tuple[Config, StateStore, Committer]:
 
 
 def _reader_for(cfg: Config, collection: str) -> tuple[CollectionConfig, DocReader]:
-    """Resolve a collection + cached reader for it, or raise ValueError."""
+    """Resolve a collection + cached reader for it, or raise ValueError.
+
+    The reader is constructed with both docs_root AND the collection's
+    scope_map so it can search/read across sub-repos when the agent asks.
+    """
     coll = cfg.resolve_collection(collection)
     if collection not in _readers:
-        _readers[collection] = DocReader(coll.docs_root)
+        _readers[collection] = DocReader(
+            docs_root=coll.docs_root,
+            scope_paths=coll.scope_map,
+        )
     return coll, _readers[collection]
 
 
@@ -139,6 +146,7 @@ def _resolve_collection(collection: str | None) -> str:
 def search(
     query: str,
     collection: str = "",
+    scope: str = "",
     category: str | None = None,
     limit: int = 25,
 ) -> str:
@@ -146,11 +154,16 @@ def search(
 
     Args:
         query: search terms.
-        collection: collection name to search. Leave empty ("") to use
-            this client's default (from X-Docflow-Collection header).
-            Pass a specific name like "homelab-docs" to override the
-            default — this is how you cross into a different collection
-            from a session whose default is something else.
+        collection: collection name. Leave empty ("") to use this
+            client's default (from X-Docflow-Collection header). Pass a
+            specific name like "homelab-docs" to override.
+        scope: which roots in the collection to search.
+            "" (default): the collection's docs_root only (cross-repo docs).
+            "*": the docs_root plus every sub-repo in scope_map.
+            "<sub-repo>": just that sub-repo's docs (e.g., "qf-sports").
+            Cross-scope hits come back with paths like
+            "qf-sports:docs/decisions/0008-foo.md" so you can round-trip
+            them to read().
         category: optional subdir under docs/ (e.g. "decisions").
         limit: max hits.
     """
@@ -158,9 +171,9 @@ def search(
     try:
         collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
+        hits = reader.search(query, category=category, limit=limit, scope=scope)
     except ValueError as e:
         return f"ERROR: {e}"
-    hits = reader.search(query, category=category, limit=limit)
     if not hits:
         return "No results."
     return "\n".join(
@@ -171,11 +184,21 @@ def search(
 
 @mcp.tool
 def read(
-    path: str, collection: str = "", section: str | None = None
+    path: str,
+    collection: str = "",
+    scope: str = "",
+    section: str | None = None,
 ) -> str:
-    """Read a doc file in a collection, optionally scoped to one heading.
+    """Read a doc file, optionally scoped to one heading.
 
-    `collection` falls back to the X-Docflow-Collection header.
+    Args:
+        path: relative path within the chosen scope's root. Can also be
+            a round-tripped search result like "qf-sports:docs/decisions/0008-foo.md"
+            — the prefix is parsed as the scope.
+        collection: falls back to X-Docflow-Collection header.
+        scope: which root to read from (see search). Default is the
+            collection's docs_root.
+        section: optional heading name; returns only that section.
     """
     cfg, _, _ = _init()
     try:
@@ -184,7 +207,7 @@ def read(
     except ValueError as e:
         return f"ERROR: {e}"
     try:
-        return reader.read(path, section=section)
+        return reader.read(path, section=section, scope=scope)
     except (FileNotFoundError, LookupError, ValueError) as e:
         return f"ERROR: {e}"
 
@@ -192,43 +215,51 @@ def read(
 @mcp.tool
 def list_docs(
     collection: str = "",
+    scope: str = "",
     category: str | None = None,
     changed_since_days: int | None = None,
 ) -> str:
     """List markdown docs in a collection, optionally filtered.
 
-    `collection` falls back to the X-Docflow-Collection header.
+    `scope` follows the same semantics as search: "" for docs_root,
+    "*" for all roots, "<sub-repo>" for just that sub-repo.
+    Cross-scope results are prefixed with scope name.
     """
     cfg, _, _ = _init()
     try:
         collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
+        rows = reader.list(
+            category=category, changed_since_days=changed_since_days, scope=scope
+        )
     except ValueError as e:
         return f"ERROR: {e}"
-    rows = reader.list(category=category, changed_since_days=changed_since_days)
     if not rows:
         return "No matching docs."
     return "\n".join(f"{r['path']}  ({r['modified']}, {r['size']}B)" for r in rows)
 
 
 @mcp.tool
-def recent(collection: str = "", limit: int = 10) -> str:
-    """Recent commits that touched any docs file in this collection.
+def recent(collection: str = "", scope: str = "", limit: int = 10) -> str:
+    """Recent git commits touching docs files in the collection.
 
-    `collection` falls back to the X-Docflow-Collection header.
+    With scope='*', commits from the docs_root AND every sub-repo are
+    merged by date. Entries from sub-repos include their scope name.
     """
     cfg, _, _ = _init()
     try:
         collection = _resolve_collection(collection)
         _, reader = _reader_for(cfg, collection)
+        rows = reader.recent(limit=limit, scope=scope)
     except ValueError as e:
         return f"ERROR: {e}"
-    rows = reader.recent(limit=limit)
     if not rows:
         return "No recent doc commits."
-    return "\n".join(
-        f"{r['sha']}  {r['date']}  {r['author']}: {r['subject']}" for r in rows
-    )
+    lines = []
+    for r in rows:
+        scope_tag = f" [{r['scope']}]" if r.get("scope") else ""
+        lines.append(f"{r['sha']}  {r['date']}  {r['author']}: {r['subject']}{scope_tag}")
+    return "\n".join(lines)
 
 
 @mcp.tool
